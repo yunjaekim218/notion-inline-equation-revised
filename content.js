@@ -1,4 +1,9 @@
-// content.js — Guided $...$ → Notion inline equation with auto-advance on real hotkey
+// content.js — Fully automated $...$ → Notion inline equation converter
+
+// Guard against double initialization (manifest injection + programmatic re-injection)
+(function() {
+if (window._notionEqConverterInit) return;
+window._notionEqConverterInit = true;
 
 const ROOTS = [".notion-page-content", ".notion-frame", "main", "body"];
 const HUD_Z = 2147483646;
@@ -14,6 +19,27 @@ const isMathAlready = el => el.closest?.(".notion-equation, .katex");
 function isInlineEqHotkey(e) {
   const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
   return e.key === "E" && e.shiftKey && (isMac ? e.metaKey : e.ctrlKey) && !e.altKey;
+}
+
+// Programmatically fire Notion's inline equation hotkey (Ctrl/Cmd+Shift+E)
+function fireInlineEquationHotkey() {
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
+  const target = document.activeElement || document.body;
+  const opts = {
+    key: "E",
+    code: "KeyE",
+    keyCode: 69,
+    which: 69,
+    shiftKey: true,
+    ctrlKey: !isMac,
+    metaKey: isMac,
+    altKey: false,
+    bubbles: true,
+    cancelable: true,
+    composed: true
+  };
+  target.dispatchEvent(new KeyboardEvent("keydown", opts));
+  target.dispatchEvent(new KeyboardEvent("keyup", opts));
 }
 
 // Collect text nodes containing $
@@ -78,13 +104,26 @@ function makeHUD() {
   });
   hud.innerHTML =
     "<b>$ → equation</b><br/>" +
-    "Press <b>Cmd/Ctrl+Shift+E</b> to convert. Auto-advances to next.<br/>" +
-    "<b>B</b> back • <b>ESC</b> exit";
+    "Auto-converting... Press <b>ESC</b> to stop";
   document.documentElement.appendChild(hud);
   return hud;
 }
-const showHUD = () => (makeHUD().style.display = "block");
 const hideHUD = () => { const h = document.getElementById("eq-hud"); if (h) h.style.display = "none"; };
+
+function updateHUD(current, total) {
+  const hud = makeHUD();
+  hud.innerHTML =
+    `<b>$ → equation</b> (${current}/${total})<br/>` +
+    `Auto-converting... Press <b>ESC</b> to stop`;
+  hud.style.display = "block";
+}
+
+function showDoneHUD(count) {
+  const hud = makeHUD();
+  hud.innerHTML = `<b>Done!</b> Converted ${count} equation(s).`;
+  hud.style.display = "block";
+  setTimeout(() => { hud.style.display = "none"; }, 3000);
+}
 
 function highlightSelection(range) {
   let box = document.getElementById("eq-box");
@@ -151,6 +190,8 @@ let guide = null;
 
 function stopGuide() {
   if (!guide) return;
+  if (guide.retryTimer) clearTimeout(guide.retryTimer);
+  if (guide.skipTimer) clearTimeout(guide.skipTimer);
   hideHUD(); hideHighlight();
   window.removeEventListener("keydown", onKey, true);
   if (guide.mo) { guide.mo.disconnect(); guide.mo = null; }
@@ -159,10 +200,17 @@ function stopGuide() {
 
 async function goStep(delta) {
   if (!guide) return;
+  if (guide.retryTimer) { clearTimeout(guide.retryTimer); guide.retryTimer = null; }
+  if (guide.skipTimer) { clearTimeout(guide.skipTimer); guide.skipTimer = null; }
   const { items } = guide;
   let i = guide.index + delta;
   if (i < 0) i = 0;
-  if (i >= items.length) { stopGuide(); return; }
+  if (i >= items.length) {
+    const count = items.length;
+    stopGuide();
+    showDoneHUD(count);
+    return;
+  }
   guide.index = i;
 
   const { tn } = items[i];
@@ -187,10 +235,14 @@ async function goStep(delta) {
   const innerLen = s.innerEnd - s.innerStart;
   const r = setSelectionInTextNode(tn, s.open, s.open + innerLen);
   highlightSelection(r);
-  showHUD();
+  updateHUD(guide.index + 1, items.length);
 
-  // arm “auto-advance after Notion wraps as equation”
+  // arm "auto-advance after Notion wraps as equation"
   armAutoAdvance();
+
+  // Automatically fire the inline equation hotkey
+  await sleep(50);
+  if (guide) fireInlineEquationHotkey();
 }
 
 // Wait until the selection is inside a Notion equation (or equation node appears), then go next
@@ -240,9 +292,17 @@ function armAutoAdvance() {
     characterData: true,
     attributes: true
   });
-}
 
-// ADD these helpers somewhere below:
+  // Retry hotkey if no conversion detected after 1s
+  guide.retryTimer = setTimeout(() => {
+    if (guide) fireInlineEquationHotkey();
+  }, 1000);
+
+  // Skip this equation if conversion still not detected after 3s
+  guide.skipTimer = setTimeout(() => {
+    if (guide) goStep(+1);
+  }, 3000);
+}
 
 // Find the inline equation dialog by looking for a contenteditable editor inside a role="dialog".
 function findEquationDialog() {
@@ -259,7 +319,7 @@ async function autoClickDialogDone(dialogEl) {
   if (btn && btn.textContent && btn.textContent.trim().toLowerCase().startsWith('done')) {
     // good
   } else {
-    // Prefer exact “Done”
+    // Prefer exact "Done"
     btn = Array.from(dialogEl.querySelectorAll('div[role="button"]'))
       .find(b => (b.textContent || '').trim().toLowerCase() === 'done');
     // Or any button that contains the enter icon (svg.enter)
@@ -274,13 +334,12 @@ async function autoClickDialogDone(dialogEl) {
   return true;
 }
 
-// Key handling: ESC (exit), B (back), and detect real inline-eq hotkey to auto-advance
+// Key handling: ESC to exit, let Notion hotkey through
 function onKey(e) {
   if (!guide) return;
 
   // Do NOT prevent the real Notion hotkey — we want Notion to receive it.
   if (isInlineEqHotkey(e)) {
-    // We just note it; MutationObserver will pick up the conversion and advance.
     return;
   }
 
@@ -289,13 +348,12 @@ function onKey(e) {
 
   if (e.key === "Escape") {
     e.preventDefault(); stopGuide();
-  } else if ((e.key === "b" || e.key === "B") && !e.ctrlKey && !e.metaKey && !e.altKey) {
-    e.preventDefault(); goStep(-1);
   }
 }
 
 // Start guided run
 async function runGuided() {
+  if (guide) return; // Already running — prevent duplicate invocation
   const items = collectItems();
   if (!items.length) return;
   guide = { items, index: -1, mo: null };
@@ -303,6 +361,11 @@ async function runGuided() {
   await goStep(+1);
 }
 
-chrome.runtime.onMessage.addListener(m => {
-  if (m?.t === "RUN_CONVERT") runGuided();
+chrome.runtime.onMessage.addListener((m, _sender, sendResponse) => {
+  if (m?.t === "RUN_CONVERT") {
+    runGuided();
+    sendResponse({ ok: true });
+  }
 });
+
+})(); // end initialization guard
