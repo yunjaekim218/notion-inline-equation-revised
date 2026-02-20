@@ -110,10 +110,10 @@ function makeHUD() {
 }
 const hideHUD = () => { const h = document.getElementById("eq-hud"); if (h) h.style.display = "none"; };
 
-function updateHUD(current, total) {
+function updateHUD(converted, total) {
   const hud = makeHUD();
   hud.innerHTML =
-    `<b>$ → equation</b> (${current}/${total})<br/>` +
+    `<b>$ → equation</b> (${converted}/${total})<br/>` +
     `Auto-converting... Press <b>ESC</b> to stop`;
   hud.style.display = "block";
 }
@@ -169,20 +169,32 @@ async function deleteSelection() {
   await sleep(STEP_DELAY);
 }
 
-// Build items
-function collectItems() {
-  const items = [];
+// Count total equations in the page (used once at start for HUD)
+function countEquations() {
+  let count = 0;
   const roots = new Set();
   for (const s of ROOTS) document.querySelectorAll(s).forEach(n => roots.add(n));
   if (!roots.size) roots.add(document.body);
+  for (const root of roots) {
+    for (const tn of textNodes(root)) {
+      count += findDollarSpans(tn.nodeValue).length;
+    }
+  }
+  return count;
+}
 
+// Find the FIRST equation in the live DOM (fresh scan each time)
+function findNextEquation() {
+  const roots = new Set();
+  for (const s of ROOTS) document.querySelectorAll(s).forEach(n => roots.add(n));
+  if (!roots.size) roots.add(document.body);
   for (const root of roots) {
     for (const tn of textNodes(root)) {
       const spans = findDollarSpans(tn.nodeValue);
-      spans.forEach(span => items.push({ tn, span }));
+      if (spans.length) return { tn, span: spans[0] };
     }
   }
-  return items;
+  return null;
 }
 
 // Guide state
@@ -198,32 +210,34 @@ function stopGuide() {
   guide = null;
 }
 
-async function goStep(delta) {
+async function goStep() {
   if (!guide) return;
   if (guide.retryTimer) { clearTimeout(guide.retryTimer); guide.retryTimer = null; }
   if (guide.skipTimer) { clearTimeout(guide.skipTimer); guide.skipTimer = null; }
-  const { items } = guide;
-  let i = guide.index + delta;
-  if (i < 0) i = 0;
-  if (i >= items.length) {
-    const count = items.length;
+
+  // Fresh DOM scan — always get a live text node, never a stale reference
+  const item = findNextEquation();
+  if (!item) {
+    const count = guide.converted;
     stopGuide();
     showDoneHUD(count);
     return;
   }
-  guide.index = i;
 
-  const { tn } = items[i];
-  const text = tn.nodeValue;
-  const spans = findDollarSpans(text);
-  if (!spans.length) return goStep(delta >= 0 ? +1 : -1);
-
-  const s = spans[0]; // recomputed; take first current span in this node
+  const { tn } = item;
+  const s = findDollarSpans(tn.nodeValue)[0];
 
   const ed = focusEditableFrom(tn);
-  if (!ed) return goStep(delta >= 0 ? +1 : -1);
+  if (!ed) {
+    // Safety: prevent infinite loop if a node can't be focused
+    guide.consecutiveSkips = (guide.consecutiveSkips || 0) + 1;
+    if (guide.consecutiveSkips > 10) { stopGuide(); return; }
+    await sleep(50);
+    return goStep();
+  }
+  guide.consecutiveSkips = 0;
 
-  // remove right delimiter
+  // remove right delimiter first (so left-side offsets stay valid)
   setSelectionInTextNode(tn, s.innerEnd, s.close);
   await deleteSelection();
 
@@ -235,7 +249,9 @@ async function goStep(delta) {
   const innerLen = s.innerEnd - s.innerStart;
   const r = setSelectionInTextNode(tn, s.open, s.open + innerLen);
   highlightSelection(r);
-  updateHUD(guide.index + 1, items.length);
+
+  guide.converted++;
+  updateHUD(guide.converted, guide.total);
 
   // arm "auto-advance after Notion wraps as equation"
   armAutoAdvance();
@@ -273,15 +289,15 @@ function armAutoAdvance() {
           doneClickedOnce = true;
           // Wait for dialog to close and for Notion to insert the equation
           setTimeout(() => {
-            if (guide) goStep(+1);
-          }, 60);
+            if (guide) goStep();
+          }, 150);
           return;
         }
       }
 
       // 2) Fallback: if Notion rendered inline immediately (no dialog), advance
       if (selectionInsideEquation()) {
-        setTimeout(() => { if (guide) goStep(+1); }, 40);
+        setTimeout(() => { if (guide) goStep(); }, 100);
       }
     });
   });
@@ -300,7 +316,7 @@ function armAutoAdvance() {
 
   // Skip this equation if conversion still not detected after 3s
   guide.skipTimer = setTimeout(() => {
-    if (guide) goStep(+1);
+    if (guide) goStep();
   }, 3000);
 }
 
@@ -310,28 +326,51 @@ function findEquationDialog() {
   return editor ? editor.closest('div[role="dialog"]') : null;
 }
 
-// Click the "Done" button inside the dialog. Returns true if we clicked it.
+// Close the equation dialog. Language-agnostic (works with Done, 완료, 完了, etc.)
 async function autoClickDialogDone(dialogEl) {
   if (!dialogEl) return false;
 
-  // Try several ways to locate the Done button robustly.
-  let btn = dialogEl.querySelector('div[role="button"]');
-  if (btn && btn.textContent && btn.textContent.trim().toLowerCase().startsWith('done')) {
-    // good
-  } else {
-    // Prefer exact "Done"
-    btn = Array.from(dialogEl.querySelectorAll('div[role="button"]'))
-      .find(b => (b.textContent || '').trim().toLowerCase() === 'done');
-    // Or any button that contains the enter icon (svg.enter)
-    if (!btn) btn = dialogEl.querySelector('div[role="button"] .enter')?.closest('div[role="button"]') || null;
+  await new Promise(r => setTimeout(r, 20));
+
+  const buttons = Array.from(dialogEl.querySelectorAll('div[role="button"]'));
+
+  // Strategy 1: Match known confirm-button labels across languages
+  const confirmLabels = ['done', '완료', '完了', '完成', 'terminé', 'fertig', 'hecho'];
+  for (const btn of buttons) {
+    const text = (btn.textContent || '').trim().toLowerCase();
+    if (confirmLabels.some(label => text.includes(label))) {
+      btn.click();
+      return true;
+    }
   }
 
-  if (!btn) return false;
+  // Strategy 2: Click button that contains an SVG icon (the ↵ enter icon)
+  for (const btn of buttons) {
+    if (btn.querySelector('svg')) {
+      btn.click();
+      return true;
+    }
+  }
 
-  // Give Notion a beat to settle text; then click.
-  await new Promise(r => setTimeout(r, 20));
-  btn.click();
-  return true;
+  // Strategy 3: Fallback — click the last button (typically the confirm action)
+  if (buttons.length) {
+    buttons[buttons.length - 1].click();
+    return true;
+  }
+
+  // Strategy 4: Simulate Enter on the equation input field
+  const input = dialogEl.querySelector('[contenteditable="true"]');
+  if (input) {
+    const enterOpts = {
+      key: "Enter", code: "Enter", keyCode: 13, which: 13,
+      bubbles: true, cancelable: true, composed: true
+    };
+    input.dispatchEvent(new KeyboardEvent("keydown", enterOpts));
+    input.dispatchEvent(new KeyboardEvent("keyup", enterOpts));
+    return true;
+  }
+
+  return false;
 }
 
 // Key handling: ESC to exit, let Notion hotkey through
@@ -354,11 +393,11 @@ function onKey(e) {
 // Start guided run
 async function runGuided() {
   if (guide) return; // Already running — prevent duplicate invocation
-  const items = collectItems();
-  if (!items.length) return;
-  guide = { items, index: -1, mo: null };
+  const total = countEquations();
+  if (!total) return;
+  guide = { converted: 0, total, mo: null, consecutiveSkips: 0 };
   window.addEventListener("keydown", onKey, true);
-  await goStep(+1);
+  await goStep();
 }
 
 chrome.runtime.onMessage.addListener((m, _sender, sendResponse) => {
