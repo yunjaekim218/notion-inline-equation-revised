@@ -162,12 +162,6 @@ function setSelectionInTextNode(node, start, end) {
   sel.addRange(r);
   return r;
 }
-async function deleteSelection() {
-  document.execCommand?.("delete");
-  const a = document.activeElement;
-  a?.dispatchEvent(new InputEvent("input", { bubbles: true, cancelable: true, inputType: "deleteContent" }));
-  await sleep(STEP_DELAY);
-}
 
 // Count total equations in the page (used once at start for HUD)
 function countEquations() {
@@ -215,6 +209,13 @@ async function goStep() {
   if (guide.retryTimer) { clearTimeout(guide.retryTimer); guide.retryTimer = null; }
   if (guide.skipTimer) { clearTimeout(guide.skipTimer); guide.skipTimer = null; }
 
+  // Close any lingering dialog from a previous step
+  const lingering = findEquationDialog();
+  if (lingering) {
+    await autoClickDialogDone(lingering);
+    await sleep(300);
+  }
+
   // Fresh DOM scan — always get a live text node, never a stale reference
   const item = findNextEquation();
   if (!item) {
@@ -229,7 +230,6 @@ async function goStep() {
 
   const ed = focusEditableFrom(tn);
   if (!ed) {
-    // Safety: prevent infinite loop if a node can't be focused
     guide.consecutiveSkips = (guide.consecutiveSkips || 0) + 1;
     if (guide.consecutiveSkips > 10) { stopGuide(); return; }
     await sleep(50);
@@ -237,28 +237,50 @@ async function goStep() {
   }
   guide.consecutiveSkips = 0;
 
-  // remove right delimiter first (so left-side offsets stay valid)
-  setSelectionInTextNode(tn, s.innerEnd, s.close);
-  await deleteSelection();
+  try {
+    // Extract inner text BEFORE modifying the DOM
+    const innerText = tn.nodeValue.substring(s.innerStart, s.innerEnd);
 
-  // remove left delimiter
-  setSelectionInTextNode(tn, s.open, s.innerStart);
-  await deleteSelection();
+    // ATOMIC replacement: select entire $...$ or $$...$$, replace with just inner text.
+    // This avoids the two-step delete that breaks when Notion re-renders between operations.
+    setSelectionInTextNode(tn, s.open, s.close);
+    document.execCommand("insertText", false, innerText);
+    await sleep(STEP_DELAY);
 
-  // select inner expression
-  const innerLen = s.innerEnd - s.innerStart;
-  const r = setSelectionInTextNode(tn, s.open, s.open + innerLen);
-  highlightSelection(r);
+    // Re-select the inner text using cursor position after insertText.
+    // After insertText, cursor sits right after the last inserted character.
+    const sel = window.getSelection();
+    if (sel.rangeCount && sel.anchorNode?.nodeType === 3) {
+      const endPos = sel.anchorOffset;
+      const startPos = endPos - innerText.length;
+      if (startPos >= 0) {
+        const r = setSelectionInTextNode(sel.anchorNode, startPos, endPos);
+        highlightSelection(r);
+      }
+    }
 
-  guide.converted++;
-  updateHUD(guide.converted, guide.total);
+    guide.converted++;
+    guide.consecutiveErrors = 0;
+    updateHUD(guide.converted, guide.total);
 
-  // arm "auto-advance after Notion wraps as equation"
-  armAutoAdvance();
+    // arm "auto-advance after Notion wraps as equation"
+    armAutoAdvance();
 
-  // Automatically fire the inline equation hotkey
-  await sleep(50);
-  if (guide) fireInlineEquationHotkey();
+    // Automatically fire the inline equation hotkey
+    await sleep(50);
+    if (guide) fireInlineEquationHotkey();
+
+  } catch (err) {
+    // Error recovery: log, wait, and continue with next equation
+    console.warn("[Notion Eq] Error processing equation, continuing:", err);
+    guide.consecutiveErrors = (guide.consecutiveErrors || 0) + 1;
+    if (guide.consecutiveErrors > 20) {
+      stopGuide();
+      return;
+    }
+    await sleep(300);
+    if (guide) goStep();
+  }
 }
 
 // Wait until the selection is inside a Notion equation (or equation node appears), then go next
@@ -290,14 +312,14 @@ function armAutoAdvance() {
           // Wait for dialog to close and for Notion to insert the equation
           setTimeout(() => {
             if (guide) goStep();
-          }, 150);
+          }, 200);
           return;
         }
       }
 
       // 2) Fallback: if Notion rendered inline immediately (no dialog), advance
       if (selectionInsideEquation()) {
-        setTimeout(() => { if (guide) goStep(); }, 100);
+        setTimeout(() => { if (guide) goStep(); }, 150);
       }
     });
   });
@@ -309,15 +331,15 @@ function armAutoAdvance() {
     attributes: true
   });
 
-  // Retry hotkey if no conversion detected after 1s
+  // Retry hotkey if no conversion detected after 1.5s
   guide.retryTimer = setTimeout(() => {
     if (guide) fireInlineEquationHotkey();
-  }, 1000);
+  }, 1500);
 
-  // Skip this equation if conversion still not detected after 3s
+  // Skip this equation if conversion still not detected after 4s
   guide.skipTimer = setTimeout(() => {
     if (guide) goStep();
-  }, 3000);
+  }, 4000);
 }
 
 // Find the inline equation dialog by looking for a contenteditable editor inside a role="dialog".
@@ -395,7 +417,7 @@ async function runGuided() {
   if (guide) return; // Already running — prevent duplicate invocation
   const total = countEquations();
   if (!total) return;
-  guide = { converted: 0, total, mo: null, consecutiveSkips: 0 };
+  guide = { converted: 0, total, mo: null, consecutiveSkips: 0, consecutiveErrors: 0 };
   window.addEventListener("keydown", onKey, true);
   await goStep();
 }
