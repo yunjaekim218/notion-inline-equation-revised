@@ -5,10 +5,10 @@
   "description": "Easily convert math formulas wrapped in $...$ or $$...$$ into true Notion inline equations. This extension saves time by detecting equations inside editable Notion blocks, skipping code and already converted text, and turning them into native math blocks. You can trigger the conversion in three ways: with a keyboard shortcut (Ctrl+M on Windows/Linux, Command+Shift+M on macOS), by clicking the toolbar button, or through a right-click menu. It works seamlessly on both notion.so and custom notion.site domains, auto-advances through multiple equations for quick processing, and provides a lightweight on-screen HUD with simple controls. Shortcuts can also be customized in chrome://extensions/shortcuts, while the toolbar button and context menu ensure easy access when shortcuts are unavailable.",
   "minimum_chrome_version": "109",
   "icons": {
-    "16": "icons/icon16.ico",
-    "32": "icons/icon32.ico",
-    "48": "icons/icon48.ico",
-    "128": "icons/icon128.ico"
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
   },
   "permissions": ["activeTab", "scripting", "contextMenus"],
   "host_permissions": ["https://www.notion.so/*", "https://*.notion.site/*"],
@@ -32,10 +32,10 @@
   },
   "action": {
     "default_icon": {
-      "16": "icons/icon16.ico",
-      "32": "icons/icon32.ico",
-      "48": "icons/icon48.ico",
-      "128": "icons/icon128.ico"
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
     },
     "default_title": "Notion Inline Equation Converter"
   }
